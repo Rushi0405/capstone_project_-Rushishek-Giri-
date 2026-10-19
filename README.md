@@ -113,8 +113,8 @@ numpy is installed automatically with pandas but isn't used directly. seaborn is
 
 I used AI tools (Claude, and Gemini through its API) on this project. This is what they were used for:
 
-- **Data and SQL:** converting the raw data into CSV files, writing `schema.sql` and `seed_data.sql`, and writing the nine report queries in `reports.sql`.
-- **Python:** writing the cleaning, analysis and chart code. I asked for simple, well-commented code so that I could follow and explain each step.
+- **Data and SQL:** converting the raw data into CSV files, writing `schema.sql` and `seed_data.sql`, and writing the output 'reports.sql'.
+- **Python:** writing the cleaning code,I asked for simple, well-commented code so that I could follow and explain each step.
 - **GenAI layer:** writing the Gemini narrator, offline fallback and number checker, following the patterns from my class Gemini notebook. Gemini itself writes the business brief in `narrator/sample_output.txt`.
 - **Checking and debugging:** re-running the pipeline to confirm every number matched the brief. This caught issues such as integer division in SQL and numbers typed in by hand.
 - **Documentation:** drafting this README, including the Reflections, which were based on the points I chose.
