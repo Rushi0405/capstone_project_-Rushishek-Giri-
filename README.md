@@ -1,308 +1,224 @@
 # Are Returns Eating Mamaearth's Margins?
 
-This project started from one suspicion on the Growth Analytics team: **some orders get returned so often that they quietly cancel out the revenue they bring in.** Everyone had a hunch about which orders those were, but nobody had traced it from raw data to a decision. This repository does exactly that, in three layers that hand results to each other:
-
-- **SQL** stores the raw orders and answers the first business questions.
-- **Python** cleans the data, tests the hunches and draws the charts.
-- **Gemini** turns the checked numbers into a short brief the ops and finance heads can act on.
-
-One rule runs through all three layers: **a number can only appear if the layer computed it or received it from the layer before.** Nothing is typed in by hand.
+An end-to-end SQL → Python → GenAI pipeline that finds which orders get returned, measures how much they cost, and turns the verified numbers into a plain-English brief for Mamaearth's ops and finance heads.
 
 ---
 
-## What I found
+## Overview
 
-The short version, for anyone who only reads this section:
+**The problem.** Mamaearth's Growth Analytics team suspected that returns were cancelling out the revenue from some orders, but nobody had traced it from raw data to a decision. This project does that, end to end.
 
-- **The raw data overstated revenue.** The order table adds up to ₹99,860.20, but five orders were submitted twice (O0176–O0180). Once they're removed, real revenue is **₹97,358.30**. The ₹2,501.90 gap is exactly the value of those five duplicates.
-- **Cash on Delivery is the problem.** COD orders come back **44.4%** of the time, against 18.9% for UPI and 14.7% for card: roughly three times the card rate.
-- **It's worse in smaller cities.** COD orders from Tier-2 cities are returned **54.5%** of the time, more than half. COD in Tier-1 cities is 37.5%, so the blended COD figure hides where the damage really is.
-- **Discounts aren't the cause or the cure.** The correlation between discount and returns is −0.09, which is too weak to mean anything. The idea that "bigger discounts reduce returns" doesn't hold up.
-- **January looked like the best month, but it wasn't.** Two bulk orders (25 and 30 units) landed in January and pushed it to ₹29,582.10. Without them, January is ₹11,637.10, and **March, at ₹20,318.90, is the real peak.**
+**The dataset.** Three CSV files covering January–June 2026:
 
-**What I'd recommend:**
-- Start with COD orders in Tier-2 cities: confirm them before dispatch and nudge customers towards prepaid.
-- Fix the double-submit bug at checkout.
-- Report revenue only after duplicates are removed.
-- Review bulk orders separately so they don't distort monthly planning.
+| File | Rows | What it holds |
+|---|---|---|
+| `data/customers.csv` | 45 | Customer, city, city tier (1 or 2), signup date, acquisition source |
+| `data/products.csv` | 16 | Product, category, price in rupees |
+| `data/orders.csv` | 180 | Order date, quantity, discount %, payment method, rating, returned (1/0) |
+
+The raw data has deliberate quality problems:
+- missing discounts and ratings
+- payment methods typed seven different ways
+- five double-submitted orders
+- two unusually large bulk orders
+
+**Objectives:**
+- Find the true revenue once data errors are removed.
+- Test whether Cash on Delivery (COD) orders are returned more often than prepaid ones.
+- Find where the return problem is concentrated.
+- Check whether discounts reduce returns.
+- Identify the real best month for revenue.
+- Give the ops and finance heads a short, actionable brief.
+
+**One rule throughout:** every number comes from code. Nothing is typed in by hand: not in the charts, the JSON or the AI prompt.
 
 ---
 
-## What's in the repo
+## Project Workflow
+
+1. **Data Collection.** The three CSV files in `data/` come from the project brief. They are never edited by hand.
+2. **Data Cleaning** (`analysis/clean_and_eda.py`):
+   - **Payment method:** standardised the casing, so 7 spellings became 3 values (CARD 70, UPI 55, COD 55).
+   - **Duplicates:** removed 5 double-submitted orders (O0176–O0180), matched on every column except `order_id`. This leaves 175 orders.
+   - **Missing values:** filled *after* removing duplicates. A missing discount became 0 (12 rows) and a missing rating became the median, 3.0 (15 rows).
+   - **Outliers:** flagged, not deleted, using the IQR rule. O0011 (25 units) and O0098 (30 units).
+   - **Saved:** the cleaned tables go to `analysis/cleaned_data/` and the key results to `narrator/findings.json`.
+3. **Exploratory Data Analysis (EDA):**
+   - Cleaned revenue is **₹97,358.30**. The ₹2,501.90 gap to the raw total is exactly the 5 duplicates.
+   - COD return rate is **44.4%**, against 18.9% for UPI and 14.7% for Card. The hypothesis is **confirmed**.
+   - The worst segment is **COD in Tier-2 cities, at 54.5%** (Tier-1 COD is 37.5%).
+   - All correlations are negligible. "Higher discounts reduce returns" is **busted** (r = −0.09).
+   - With the outliers excluded, **March (₹20,318.90)** is the real peak. January only looked best because of the two bulk orders.
+4. **Visualization** (`analysis/visualize.py`). It reads the cleaned CSV and draws two matplotlib charts:
+   - a sorted bar chart of return rate by payment method, with COD highlighted;
+   - a line chart of monthly revenue with the outliers excluded, with the peak labelled.
+
+   Chart titles are built from the data.
+
+   ![Return rate by payment method](visualizations/return_rate_by_payment.png)
+   ![Monthly revenue, outliers excluded](visualizations/monthly_revenue_trend.png)
+5. **SQL Analysis** (`sql/`):
+   - `schema.sql` builds three linked tables with keys and constraints.
+   - `seed_data.sql` loads every row, with blank cells stored as `NULL`.
+   - `reports.sql` runs 9 business reports on the raw data, with each output pasted above its query.
+6. **GenAI Narrative** (`narrator/generate_narrative.py`):
+   - **Brief:** Gemini turns `findings.json` into a Situation–Complication–Resolution brief.
+   - **Prompt design:** a system instruction sets the role, the structure and the rule "use only the supplied numbers". The prompt itself is built from `findings.json`.
+   - **Settings:** temperature 0.0, a 2048-token limit and a 30-second timeout, all inside `try/except`.
+   - **Offline fallback:** a template builds the same brief when there's no API key.
+   - **Number check:** a checker confirms the 5 key figures are present and prints PASS or FAIL for each.
+
+---
+
+## Architecture
 
 ```
-<repo>/
-├── README.md                  you are here
-├── requirements.txt           Python packages
+data/*.csv (raw)
+   │
+   ├──▶ SQL (SQLite):  schema.sql → seed_data.sql → reports.sql
+   │                   Report (a) raw revenue = ₹99,860.20 ──────────┐ compared
+   │                                                                  │
+   └──▶ Python (pandas): analysis/clean_and_eda.py  ◀────────────────┘ prints MATCH
+           │   cleans, analyses, recomputes the raw total
+           ├──▶ analysis/cleaned_data/*.csv ──▶ analysis/visualize.py ──▶ visualizations/*.png
+           └──▶ narrator/findings.json ──▶ narrator/generate_narrative.py ──▶ SCR brief
+                                              (Gemini, or offline template)  + 5-figure check
+```
+
+- **SQL database for structured queries.** SQLite stores the raw orders and answers the 9 report questions. As the brief requires, the Python layer reads the CSVs directly, so the two layers can run in either order. Python recalculates SQL's raw total to prove they agree, and prints `MATCH` if the database exists.
+- **Python scripts for cleaning and EDA.** `clean_and_eda.py` does every cleaning and analysis step and prints each result. It hands off two outputs: the cleaned CSVs for the charts, and `findings.json` for the narrative.
+- **Visualizations for insights.** `visualize.py` only reads the cleaned CSV, so it never repeats the analysis.
+- **GenAI for the business brief.** `generate_narrative.py` reads only `findings.json`. If the data changed, the brief would change with it.
+
+---
+
+## Tools & Libraries Used
+
+| Tool | Version | Used for |
+|---|---|---|
+| **Python** | 3.9 or newer (tested on 3.13) | Cleaning, analysis, charts, narrative |
+| **pandas** | ≥ 2.0 (tested on 3.0) | Loading, cleaning, merging, grouping, correlation, time series |
+| **matplotlib** | ≥ 3.7 (tested on 3.11) | The two charts |
+| **google-genai** | ≥ 1.0 (tested on 2.29) | Gemini API client; model `gemini-3.1-flash-lite` (free tier) |
+| **SQLite** (`sqlite3` command-line tool) | 3.x (tested on 3.45) | Database, schema and the 9 SQL reports |
+| **Python standard library** | — | `sqlite3` (cross-check with SQL), `json` (findings file), `os`, `re`, `datetime` |
+| **Google Colab / Jupyter Notebook** | — | Running and testing the code interactively |
+| **Git and GitHub** | — | Version control and submission |
+
+numpy is installed automatically with pandas but isn't used directly. seaborn isn't used.
+
+---
+
+## AI Assistance Disclosure
+
+I used AI tools (Claude, and Gemini through its API) on this project. This is what they were used for:
+
+- **Data and SQL:** converting the raw data into CSV files, writing `schema.sql` and `seed_data.sql`, and writing the nine report queries in `reports.sql`.
+- **Python:** writing the cleaning, analysis and chart code. I asked for simple, well-commented code so that I could follow and explain each step.
+- **GenAI layer:** writing the Gemini narrator, offline fallback and number checker, following the patterns from my class Gemini notebook. Gemini itself writes the business brief in `narrator/sample_output.txt`.
+- **Checking and debugging:** re-running the pipeline to confirm every number matched the brief. This caught issues such as integer division in SQL and numbers typed in by hand.
+- **Documentation:** drafting this README, including the Reflections, which were based on the points I chose.
+
+**My part:** I provided the brief and the raw data, ran all the code myself in Google Colab, generated `sample_output.txt` with my own free Gemini key, and checked the results against the brief.
+
+---
+
+## Folder Structure
+
+```
+capstone_project_-Rushishek-Giri-/
+├── README.md
+├── requirements.txt              Python packages
+├── data/                         raw CSVs (never edited)
+│   ├── customers.csv
+│   ├── products.csv
+│   └── orders.csv
 ├── sql/
-│   ├── schema.sql             creates the customers, products and orders tables
-│   ├── seed_data.sql          loads every CSV row (blank cells become NULL)
-│   └── reports.sql            the nine report queries, each with its real output above it
-├── data/
-│   ├── customers.csv          45 customers: city, city tier, signup date, how they found us
-│   ├── products.csv           16 products: name, category, price in rupees
-│   └── orders.csv             180 orders: date, quantity, discount, payment method, rating, returned
+│   ├── schema.sql                Part 1, Task 1: tables, keys, constraints
+│   ├── seed_data.sql             Part 1, Task 2: loads all rows (blanks → NULL)
+│   └── reports.sql               Part 1, Task 3: 9 reports with outputs pasted above
 ├── analysis/
-│   ├── clean_and_eda.py       cleaning + analysis (Part 2, Tasks 1–10); writes narrator/findings.json
-│   ├── visualize.py           draws the two charts from the cleaned CSV (Part 2, Task 11)
+│   ├── clean_and_eda.py          Part 2, Tasks 1–10; saves cleaned CSVs + findings.json
+│   ├── visualize.py              Part 2, Task 11: draws the 2 charts from the cleaned CSV
+│   └── cleaned_data/             created when clean_and_eda.py runs
 ├── visualizations/
 │   ├── return_rate_by_payment.png
 │   └── monthly_revenue_trend.png
 └── narrator/
-    ├── findings.json          the checked numbers, written by clean_and_eda.py
-    ├── generate_narrative.py  Gemini brief + offline fallback + number checker
-    └── sample_output.txt      one real Gemini run, saved and checked
+    ├── findings.json             verified numbers, written by clean_and_eda.py
+    ├── generate_narrative.py     Part 3: Gemini brief + offline fallback + checker
+    └── sample_output.txt         one real Gemini run, saved and checked
 ```
-
-The CSVs in `data/` are the original files and have never been edited by hand. All cleaning happens in Python.
 
 ---
 
-## How the three layers connect
+## How to Run the Project
 
-```
-data/*.csv
-   │
-   ├─▶ SQL:     schema.sql → seed_data.sql → reports.sql
-   │            Report (a): raw revenue = 99,860.20 ──────────────┐
-   │                                                              │ compared
-   └─▶ Python:  clean_and_eda.py (reads the CSVs directly)        │
-                recomputes the raw total = 99,860.20  ◀───────────┘  → prints MATCH
-                cleans → 97,358.30, COD 44.4%, COD Tier-2 54.5%, March peak
-                   │
-                   ├─▶ analysis/cleaned_data/*.csv → visualize.py → the two PNG charts
-                   └─▶ narrator/findings.json
-                          │
-                          ▼
-             GenAI:  generate_narrative.py
-                     Gemini (with a key) or offline template (without one)
-                     → Situation / Complication / Resolution brief + number check
-```
+Run every command from the main project folder, in this order. Results are identical on every run.
 
-- **SQL to Python.** The brief asked for the Python part to work from the raw CSVs, not the database, so Parts 1 and 2 can run in either order. To make sure the two agree, Python recalculates the SQL raw total itself and gets the same ₹99,860.20. If the SQLite database is sitting in the folder, it also queries it directly and prints `MATCH`.
-- **Python to GenAI.** The last thing `clean_and_eda.py` does is write `narrator/findings.json` from its own variables. The narrator reads nothing else, so if the data changed, the brief would change with it.
-
----
-
-## What you need
-
-- **Python 3.9 or newer**, with pandas, matplotlib and google-genai (all in `requirements.txt`).
-- **The `sqlite3` command-line tool**, for Part 1.
-- **A Gemini API key: optional.** A free key from Google AI Studio is enough; don't use a paid-only key. Without any key, Part 3 still runs fully offline. The whole project can be run and checked at no cost and with no internet.
-
----
-
-## Running it yourself
-
-Run every command from the main project folder. Running it again always gives the same numbers, the same `findings.json` and identical charts.
-
-### On your own computer
-
-**1. Open a terminal.**
-- **Windows:** open Command Prompt (`cmd`), not PowerShell, because the `<` used below doesn't work in PowerShell.
-- **Mac:** open Terminal.
-- **Linux:** open your usual terminal.
-
-**2. Check Python.**
+**1. Get the project and install the dependencies**
 ```bash
-python --version
-```
-It should say 3.9 or higher. On Mac and Linux you may need `python3` and `pip3` instead of `python` and `pip`. On Windows, if Python isn't found, reinstall it and tick "Add Python to PATH".
-
-**3. Get the project and install the packages.**
-```bash
-git clone <this-repo-url>
-cd <repo-folder>
+git clone https://github.com/Rushi0405/capstone_project_-Rushishek-Giri-.git
+cd capstone_project_-Rushishek-Giri-
 pip install -r requirements.txt
 ```
-No Git? Use **Code → Download ZIP** on the GitHub page, unzip it, and `cd` into the folder.
-
-**4. Install SQLite if you don't have it** (`sqlite3 --version` tells you).
-- **Windows:** download the "sqlite-tools" bundle from the official SQLite site. Unzip it and put `sqlite3.exe` on your PATH, or in the project folder.
-- **Mac:** it's usually already there. If not, run `brew install sqlite`.
+You also need the `sqlite3` command-line tool:
+- **Mac:** usually pre-installed.
 - **Linux:** `sudo apt-get install sqlite3`
+- **Windows:** download the sqlite-tools bundle from the official SQLite site.
+- **Google Colab:** `!apt-get -qq install -y sqlite3`
 
-**5. Part 1: build the database and run the reports.**
+On Windows, use Command Prompt, not PowerShell, for the `<` commands below.
+
+**2. Load the SQL schema and data, then run the reports (Part 1)**
 ```bash
 sqlite3 mamaearth.db < sql/schema.sql
 sqlite3 mamaearth.db < sql/seed_data.sql
 sqlite3 -header -column mamaearth.db < sql/reports.sql
 ```
-- If you're in PowerShell anyway, pipe the files in instead: `Get-Content sql/schema.sql | sqlite3 mamaearth.db`
-- If you can't install `sqlite3`, Python can build the database:
-  `python -c "import sqlite3; c=sqlite3.connect('mamaearth.db'); [c.executescript(open(f).read()) for f in ('sql/schema.sql','sql/seed_data.sql')]"`
-  Then open `mamaearth.db` in a free tool such as DB Browser for SQLite and run the queries there.
+Report (a) should print `180  99860.20  554.78`. Every report matches the `-- Output:` comment above it. Report (i) adds a column, so rebuild the database before running `reports.sql` again.
 
-**6. Part 2: clean, analyse and chart.**
+**3. Run the data cleaning and EDA (Part 2)**
 ```bash
 python analysis/clean_and_eda.py
+```
+- **Prints** every task's result, including `Rs 97358.30`, `CONFIRMED`, `COD + Tier-2 cities at 54.5%`, `Highest month: 2026-03`, and `MATCH` if step 2 ran first.
+- **Saves** the cleaned CSVs in `analysis/cleaned_data/`, plus `narrator/findings.json`.
+
+**4. Create the charts**
+```bash
 python analysis/visualize.py
 ```
+This reads `analysis/cleaned_data/orders_merged_clean.csv` and saves both PNGs in `visualizations/`.
 
-**7. Part 3: write the brief.**
+**5. Generate the business narrative (Part 3)**
+- **Without an API key** (offline template): `python narrator/generate_narrative.py`
+- **With a free Gemini key from Google AI Studio:** set it as an environment variable, never in a file:
+  ```bash
+  export GEMINI_API_KEY="your-key-here"        # Mac / Linux
+  set GEMINI_API_KEY=your-key-here             # Windows Command Prompt
+  python narrator/generate_narrative.py
+  ```
+  In Google Colab, store the key in **Secrets**, then run:
+  ```python
+  import os
+  from google.colab import userdata
+  os.environ["GEMINI_API_KEY"] = userdata.get("SY_API_KEY")
+  ```
 
-Without a key, this works straight away:
-```bash
-python narrator/generate_narrative.py
-```
-
-With your own free Gemini key:
-1. In Google AI Studio, choose **Get API key → Create API key in new project**, and copy the key.
-2. Set it in the same terminal window, then run the script. Never paste the key into a `.py` file.
-
-```bash
-set GEMINI_API_KEY=your-key-here           # Windows Command Prompt (no quotes)
-$env:GEMINI_API_KEY="your-key-here"        # Windows PowerShell
-export GEMINI_API_KEY="your-key-here"      # Mac / Linux
-python narrator/generate_narrative.py
-```
-
-The key only lasts until you close that terminal. If it's wrong or the free quota runs out, the script says so and switches to the offline brief without crashing.
-
-### In Google Colab
-Nothing needs installing on your machine:
-```python
-!git clone <this-repo-url>
-%cd <repo-folder>
-!pip install -q -r requirements.txt
-!apt-get -qq install -y sqlite3 > /dev/null
-
-!sqlite3 mamaearth.db < sql/schema.sql
-!sqlite3 mamaearth.db < sql/seed_data.sql
-!sqlite3 -header -column mamaearth.db < sql/reports.sql
-
-!python analysis/clean_and_eda.py
-!python analysis/visualize.py
-```
-For Part 3, save your key in Colab's **Secrets** panel (the key icon) and turn on notebook access. Then run:
-```python
-import os
-from google.colab import userdata
-os.environ["GEMINI_API_KEY"] = userdata.get("GEMINI_API_KEY")   # the name you gave the secret
-!python narrator/generate_narrative.py
-```
-Skip the key lines to run Part 3 offline.
-
-### How to tell it worked
-- **Part 1:** Report (a) prints `180  99860.20  554.78`, and every report matches the `-- Output:` comment above it.
-- **Part 2:** you'll see `Rs 97358.30`, `Difference   : 2501.90`, `CONFIRMED`, `COD + Tier-2 cities at 54.5%` and `Highest month: 2026-03`. If Part 1 ran first, you'll also see `MATCH`.
-- **Charts:** two PNG files appear in `visualizations/`.
-- **Part 3:** a brief with Situation, Complication and Resolution sections, followed by five `[PASS]` lines.
+Either way, you should see a Situation / Complication / Resolution brief followed by five `[PASS]` lines. If the key is wrong or the free quota runs out, the script automatically uses the offline brief instead of crashing.
 
 ---
 
-## Part 1: SQL
+## Key Findings
 
-`schema.sql` builds three linked tables. Orders point to customers and products through foreign keys, `returned` defaults to 0, and every column that must have a value is `NOT NULL`. I left `discount_pct` and `rating` nullable on purpose: an order without a promo code or a review is normal, not broken.
+- **Revenue was overstated.** Five duplicate orders inflated the raw total (₹99,860.20). True revenue is **₹97,358.30**, and the ₹2,501.90 gap is exactly those duplicates.
+- **COD is the return problem.** COD orders are returned **44.4%** of the time, about three times the card rate (14.7%). UPI is at 18.9%.
+- **The damage is concentrated in Tier-2 cities.** **54.5%** of COD orders there come back, compared with 37.5% in Tier-1.
+- **Discounts aren't the answer.** Discount and returns are barely related (r = −0.09).
+- **March, not January, is the best month.** Two bulk orders made January look like the peak (₹29,582.10). Without them, **March, at ₹20,318.90**, leads.
 
-`seed_data.sql` is one `INSERT` per CSV row, inside a single transaction. It clears the tables first, so it can be run again safely. I chose generated inserts over SQLite's `.import` because `.import` loads blank cells as empty text, which would quietly break `COUNT(rating)`. After loading there are 45 customers, 16 products and 180 orders.
-
-`reports.sql` runs nine queries on the raw data. Revenue for each order is `quantity × price × (1 − discount/100)`, with a missing discount counted as 0%. I divide by `100.0` rather than `100` because SQLite would otherwise do whole-number division and wipe out every discount.
-
-| | What it shows | Technique | Result |
-|---|---|---|---|
-| a | Orders, revenue, average order value | `JOIN`, `SUM`, `AVG`, `COALESCE` | 180 · ₹99,860.20 · ₹554.78 |
-| b | Orders still without a rating | `COUNT(*)` vs `COUNT(rating)` | 180 vs 165, so 15 unrated |
-| c | Customers who never ordered | `LEFT JOIN`, then checked again with `NOT IN` | Both say C045 Vihaan |
-| d | Cities returning more than 20% | `GROUP BY` + `HAVING` | Jaipur 42.1%, Lucknow 30.6%, Bangalore 24.2% |
-| e | Top spenders, then ranks 3–5 | `ORDER BY` + `LIMIT` / `OFFSET` | Reyansh leads with ₹12,920.00 |
-| f | Revenue by category | three-table `JOIN` | Haircare ₹44,956.10 is the largest |
-| g | Names starting with "A" | `LIKE 'A%'` | 10 customers |
-| h | How customers found us | `DISTINCT` | Ad, Organic, Referral, Social |
-| i | Loyalty tier from city tier | `ALTER TABLE` + `UPDATE … CASE` | 28 Gold, 17 Silver |
-
-Report (i) adds a column, so to run the file a second time, rebuild the database first.
-
----
-
-## Part 2: cleaning and analysis in Python
-
-`clean_and_eda.py` reads the three CSVs with pandas and prints every result as it goes. The order of the steps matters, so here they are in sequence:
-
-1. **Load:** orders start as 180 rows × 9 columns.
-2. **Fix the payment labels:** the same three methods were typed seven different ways (`COD`/`cod`, `Card`/`card`/`CARD`, `UPI`/`upi`). Stripping spaces and upper-casing leaves CARD 70, UPI 55, COD 55.
-3. **Drop duplicates:** I matched rows on every column except `order_id`, because the double-submitted orders got new IDs. Exactly five came out (O0176–O0180), leaving 175 rows.
-4. **Fill gaps:** this happens after de-duplication, so copies can't skew the median. A missing discount means no promo code, so it becomes 0 (12 rows). A missing rating gets the median rating, 3.0 (15 rows).
-5. **Merge and reconcile:** joining prices and cities gives a cleaned revenue of ₹97,358.30. The script then values the five dropped duplicates on their own and shows they add up to exactly the ₹2,501.90 gap. Filling the blanks didn't move the total, because a blank discount was already treated as 0% in SQL.
-6. **Spot unusual quantities:** using the IQR rule (Q1 = 1, Q3 = 2, limits −0.5 to 3.5), orders O0011 and O0098 stand out. I **flag** them in an `is_outlier` column instead of deleting them.
-7. **Test the COD hunch:** grouping returns by payment method confirms it, at 44.4% for COD.
-8. **Split by city tier:** COD in Tier-2 cities is the single worst segment, at 54.5%.
-9. **Correlations:** all six pairs among rating, returns, discount and quantity are negligible (below 0.2). That rules out the discount theory.
-10. **Monthly trend:** I compute monthly revenue twice, with and without the flagged orders. Flagging them first is what reveals March as the real peak.
-
-Finally, the script writes the figures Part 3 needs into `narrator/findings.json`, along with a note saying which script produced them.
-
-### How the charts were made
-
-`visualize.py` uses matplotlib. It doesn't repeat the analysis. It reads the cleaned table that `clean_and_eda.py` saved (`analysis/cleaned_data/orders_merged_clean.csv`), works out the return rates and the outlier-free monthly totals from it, and draws the charts. No number is copied in by hand. If the cleaned file isn't there yet, it tells you to run `clean_and_eda.py` first.
-
-**Return rate by payment method**
-
-![Return rate by payment method](visualizations/return_rate_by_payment.png)
-
-- Bars run from highest to lowest, so the problem reads first.
-- COD is the only coloured bar.
-- Each bar carries its exact percentage.
-- The title, "COD Returns at 44.4% — 3x Card", is built from the data, so it can't drift from the numbers.
-
-**Monthly revenue, outliers excluded**
-
-![Monthly revenue trend](visualizations/monthly_revenue_trend.png)
-
-- This chart deliberately uses the corrected series. The raw one would wrongly crown January.
-- The peak is labelled with its value.
-- The axis starts at zero.
-- The title names March 2026 as the peak, again taken from the data.
-
----
-
-## Part 3: the AI-written brief
-
-`generate_narrative.py` turns `findings.json` into a short brief in the Situation–Complication–Resolution shape. Here's how it works, step by step:
-
-1. **Read the numbers.** If `findings.json` is missing, the script stops and tells you to run Part 2 first. It never guesses.
-2. **Split instructions from data.** The fixed rules go in Gemini's system instruction:
-   - who's writing (a senior analyst writing for the regional ops and finance heads),
-   - the three labelled sections,
-   - how to format rupees, percentages and months,
-   - the most important rule: use only the supplied numbers, unchanged.
-
-   The data goes in the user prompt, which is built from `findings.json` with f-strings. No figure is typed into the prompt.
-3. **Call Gemini with fixed settings.** The call uses `client.models.generate_content` with the free `gemini-3.1-flash-lite` model:
-   - **temperature 0.0**, because this is a factual report, not creative writing;
-   - **a 2048-token output limit**, so the brief is never cut off;
-   - **a 30-second timeout**, written as 30000 milliseconds.
-
-   The call sits inside `try/except` and always returns a small dictionary, with status `success` or `error`, so a failed call never crashes the program. An empty or cut-off answer also counts as an error.
-4. **Fall back when needed.** With no key, or after any error, `generate_scr_narrative_offline()` builds the same three sections from a template filled with the same numbers. It needs no key or internet, and gives the same output every time.
-5. **Check the result.** A checker looks for the five figures that matter and prints PASS or FAIL for each: 97,358.30, 44.4, 54.5, 2,501.90, and March with 20,318.90. Commas are ignored when comparing. It also warns if the brief contains any number that isn't in `findings.json`. A successful Gemini run is saved to `sample_output.txt`, and the checker runs again on the saved file.
-
-The API key is only ever read from the `GEMINI_API_KEY` environment variable or from Colab Secrets. It is never stored in the code or in this repo.
-
----
-
-## Tools at a glance
-
-| Layer | Tools | What I used them for |
-|---|---|---|
-| Storage and reports | SQLite, SQL | Schema with keys and constraints, joins, grouping, ranking, schema changes |
-| Cleaning and analysis | Python, pandas | Text fixes, de-duplication, imputation, merges, IQR outliers, group rates, correlation, monthly series |
-| Charts | matplotlib | A sorted bar chart and a line chart, both drawn from computed results |
-| Narrative | Google Gemini (`google-genai`) | System instruction, data-driven prompt, locked parameters, error handling, offline fallback, number checks |
-
----
-
-## If something goes wrong
-
-| What you see | What to do |
-|---|---|
-| `sqlite3: command not found` | Install SQLite (step 4), or use the Python one-liner in step 5 |
-| `duplicate column name: loyalty_tier` | Report (i) already ran. Rebuild the database with `schema.sql` and `seed_data.sql`, then run `reports.sql` again. |
-| `FileNotFoundError: data/orders.csv` | You're inside a subfolder. `cd` back to the main project folder. |
-| `narrator/findings.json not found` | Run `python analysis/clean_and_eda.py` first |
-| "using the offline template" | No key is set. That's fine; set `GEMINI_API_KEY` if you want Gemini. |
-| `API key not valid` or a 429 error | Check the key, or wait a minute for the free-tier limit. The script falls back to the offline brief automatically. |
-| `ModuleNotFoundError: google` | Run `pip install -r requirements.txt` |
+**Recommendation:** confirm COD orders in Tier-2 cities before dispatch and encourage prepaid payment. Fix the double-submit bug at checkout. Report revenue only after removing duplicates.
 
 ---
 
@@ -328,8 +244,10 @@ The second is return rates at the product and category level. My analysis broke 
 
 ---
 
-## **AI assistance**
+## Author
 
-I used Claude and Gemini as an AI assistant on this project. It helped me convert the raw data into CSV files and Created the mamaearths database, write the Python code for analysis and chart, and the Gemini narrator, and it drafted this README, including the Reflections. I asked for simple, well-commented code so that I could follow as well as other's and explained each step.
+**Rushishek Giri**
 
-I provided the raw data, ran the code myself in Google Colab, generated sample_output.txt with my own Gemini key.
+## Last Updated
+
+19 October 2026
